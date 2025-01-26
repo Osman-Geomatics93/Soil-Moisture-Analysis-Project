@@ -1,0 +1,205 @@
+var START_DATE = '2006-01-01';
+var END_DATE = '2010-12-31';
+var SCALE = 11000;
+var DROUGHT_THRESHOLD = 0.00002;
+
+var dataset = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE")
+  .filterBounds(table)
+  .filterDate(START_DATE, END_DATE)
+  .select(['soil', 'pr', 'pet']);
+
+var soilData = dataset.select('soil');
+var months = ee.List.sequence(1, 12);
+var years = ee.List.sequence(2006, 2010);
+
+var byMonthYear = ee.FeatureCollection(
+  years.map(function(y) {
+    return months.map(function(m) {
+      var filtered = soilData
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .mean();
+      
+      var stats = filtered.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: table,
+        scale: SCALE
+      });
+      
+      var isDrought = ee.Number(stats.get('soil')).lt(DROUGHT_THRESHOLD);
+      
+      return ee.Feature(null, {
+        'soil_value': stats.get('soil'),
+        'year': ee.Number(y).format('%d'),
+        'month': m,
+        'date': ee.Date.fromYMD(y, m, 1).format('MMM'),
+        'drought_alert': isDrought
+      });
+    });
+  }).flatten()
+);
+
+var summaryStats = byMonthYear.reduceColumns({
+  reducer: ee.Reducer.mean()
+    .combine(ee.Reducer.stdDev(), '', true)
+    .combine(ee.Reducer.minMax(), '', true),
+  selectors: ['soil_value']
+});
+
+var calculateBandCorrelation = function(band1, band2) {
+  var joined = dataset.select([band1, band2]);
+  return joined.reduce(ee.Reducer.pearsonsCorrelation());
+};
+
+var soilPrecipCorr = calculateBandCorrelation('soil', 'pr');
+var soilPetCorr = calculateBandCorrelation('soil', 'pet');
+
+var advancedChart = ui.Chart.feature.groups({
+  features: byMonthYear,
+  xProperty: 'month',
+  yProperty: 'soil_value',
+  seriesProperty: 'year'
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Monthly Soil Moisture by Year',
+  titleTextStyle: {fontSize: 16, bold: true},
+  hAxis: {
+    title: 'Month',
+    titleTextStyle: {italic: false, bold: true},
+    gridlines: {count: 12},
+    ticks: [1,2,3,4,5,6,7,8,9,10,11,12]
+  },
+  vAxis: {
+    title: 'Soil Moisture',
+    titleTextStyle: {italic: false, bold: true},
+    gridlines: {count: 10},
+    viewWindow: {min: 0}
+  },
+  series: {
+    0: {color: '#1a237e', lineWidth: 2},
+    1: {color: '#0d47a1', lineWidth: 2},
+    2: {color: '#1976d2', lineWidth: 2},
+    3: {color: '#039be5', lineWidth: 2},
+    4: {color: '#00acc1', lineWidth: 2}
+  },
+  pointSize: 4,
+  legend: {position: 'right'},
+  curveType: 'function',
+  interpolateNulls: true
+});
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+var makeRow = function(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 8px 0 0'
+    }
+  });
+  return ui.Panel([colorBox, ui.Label(name)], ui.Panel.Layout.Flow('horizontal'));
+};
+
+legend.add(ui.Label('Soil Moisture Levels'));
+legend.add(makeRow('#1a237e', '2006'));
+legend.add(makeRow('#0d47a1', '2007'));
+legend.add(makeRow('#1976d2', '2008'));
+legend.add(makeRow('#039be5', '2009'));
+legend.add(makeRow('#00acc1', '2010'));
+
+var panel = ui.Panel({
+  style: {
+    position: 'top-right',
+    padding: '8px'
+  }
+});
+
+var yearSelector = ui.Select({
+  items: ['2006', '2007', '2008', '2009', '2010'],
+  placeholder: 'Select Year',
+  onChange: function(year) {
+    var yearData = byMonthYear.filter(ee.Filter.eq('year', year));
+    var yearChart = ui.Chart.feature.byFeature(yearData, 'month', 'soil_value')
+      .setOptions({
+        title: 'Soil Moisture for ' + year,
+        lineWidth: 2,
+        pointSize: 4
+      });
+    print(yearChart);
+    var droughtAlerts = yearData.filter(ee.Filter.eq('drought_alert', true));
+    print('Drought Alerts for ' + year + ':', droughtAlerts);
+  }
+});
+
+var statsPanel = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+statsPanel.add(ui.Label('Statistical Summary:', {fontWeight: 'bold'}));
+statsPanel.add(ui.Label('Mean: ' + summaryStats.get('mean').getInfo().toFixed(2)));
+statsPanel.add(ui.Label('StdDev: ' + summaryStats.get('stdDev').getInfo().toFixed(2)));
+statsPanel.add(ui.Label('Min: ' + summaryStats.get('min').getInfo().toFixed(2)));
+statsPanel.add(ui.Label('Max: ' + summaryStats.get('max').getInfo().toFixed(2)));
+
+panel.add(ui.Label('Filter by Year:'));
+panel.add(yearSelector);
+
+var soilViz = {
+  min: 0,
+  max: 0.00005,
+  palette: ['#000004', '#2C115F', '#721F81', '#B63679', 
+            '#F1605D', '#FEAF77', '#FCFDBF']
+};
+
+Map.centerObject(table);
+Map.addLayer(soilData.mean().clip(table), soilViz, 'Mean Soil Moisture');
+Map.add(panel);
+Map.add(legend);
+Map.add(statsPanel);
+
+print('Soil Moisture Analysis');
+print(advancedChart);
+print('Soil-Precipitation Correlation:', soilPrecipCorr);
+print('Soil-PET Correlation:', soilPetCorr);
+
+Export.table.toDrive({
+  collection: byMonthYear,
+  description: 'soil_moisture_analysis',
+  fileFormat: 'CSV'
+});
+
+Export.image.toDrive({
+  image: soilData.mean().clip(table),
+  description: 'soil_moisture_map',
+  scale: SCALE,
+  region: table,
+  maxPixels: 1e9,
+  fileFormat: 'GeoTIFF'
+});
+
+// For multiple years
+years.getInfo().forEach(function(year) {
+  var yearImage = soilData
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .mean()
+    .clip(table);
+    
+  Export.image.toDrive({
+    image: yearImage,
+    description: 'soil_moisture_map_' + year,
+    scale: SCALE,
+    region: table,
+    maxPixels: 1e9,
+    fileFormat: 'GeoTIFF'
+  });
+});
